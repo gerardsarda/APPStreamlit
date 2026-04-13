@@ -1,122 +1,163 @@
 """
 train_models.py
 ---------------
-Ejecutar UNA VEZ antes de lanzar la app:
+Ejecutar UNA VEZ desde la carpeta airbnb_app:
     python models/train_models.py
 
-Entrena XGBoost (precio) y LogisticRegression (alta ocupación)
-usando los datos reales de BigQuery exportados en los CSV.
-Guarda los modelos como .pkl en esta misma carpeta.
+Replica EXACTAMENTE el notebook del grupo (Cell 12 modelo final R²~0.82
+y Modelo 3 LogReg ocupación AUC~0.75).
 """
 
 import pandas as pd
 import numpy as np
 import pickle
 import os
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import OrdinalEncoder, StandardScaler
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import r2_score, roc_auc_score
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error, roc_auc_score
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
 import xgboost as xgb
 
-# ── Rutas ────────────────────────────────────────────────────────────────────
-BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR   = os.path.join(BASE_DIR, '..', 'data')
-SCATTER_CSV = os.path.join(DATA_DIR, 'scatter_listings.csv')
-BARRIOS_CSV = os.path.join(DATA_DIR, 'barrios_medias.csv')
+RANDOM_STATE = 42
+BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR  = os.path.join(BASE_DIR, '..', 'data')
+CSV_PATH  = os.path.join(DATA_DIR, 'dataset_completo.csv')
 
-# ── Cargar datos ─────────────────────────────────────────────────────────────
-print("Cargando datos...")
-df = pd.read_csv(SCATTER_CSV)
-barrios = pd.read_csv(BARRIOS_CSV)
+# ── 1. Cargar datos ───────────────────────────────────────────────────────────
+print("Cargando dataset completo...")
+df = pd.read_csv(CSV_PATH)
+print(f"Shape original: {df.shape[0]:,} filas x {df.shape[1]} columnas")
 
-# Merge con variables externas por barrio
-df = df.merge(
-    barrios[['barrio','dist_obelisco','crimes','subte','density']],
-    on='barrio', how='left'
-)
+# ── 2. Filtro outliers p1-p99 (igual que notebook Cell 12) ───────────────────
+q_low  = df['log_precio'].quantile(0.01)
+q_high = df['log_precio'].quantile(0.99)
+df = df[(df['log_precio'] > q_low) & (df['log_precio'] < q_high)].copy()
+print(f"Tras filtro outliers: {df.shape[0]:,} filas")
 
-print(f"Dataset: {df.shape[0]} filas, {df.shape[1]} columnas")
-print(f"Barrios: {df['barrio'].nunique()}")
-
-# ── Definir features ─────────────────────────────────────────────────────────
+# ── 3. Features (replica exacta notebook Cell 12) ────────────────────────────
 VARS_NUM = [
-    'accommodates', 'amenity_count',
-    'dist_obelisco', 'crimes', 'subte', 'density',
+    'accommodates', 'bedrooms', 'bathrooms', 'beds',
+    'review_scores_rating', 'number_of_reviews',
+    'reviews_per_month', 'number_of_reviews_ltm',
+    'distancia_al_obelisco_m', 'density',
+    'crimes', 'subte',
+    'top_atracciones_within_1000m',
+    'num_amenities', 'antiguedad_host',
+    'host_listings_count',
+    'review_scores_location', 'review_scores_cleanliness',
+    'review_scores_checkin', 'review_scores_communication',
+    'review_scores_accuracy', 'review_scores_value',
 ]
 VARS_CAT = ['barrio', 'room_type']
-TARGET_PRICE = 'precio'
-TARGET_OCUP  = 'ocupacion'
 
-df = df.dropna(subset=VARS_NUM + VARS_CAT + [TARGET_PRICE, TARGET_OCUP])
-df = df[df[TARGET_PRICE] > 0]
-df = df[df[TARGET_OCUP] >= 0]
+df_common = df[['log_precio', 'estimated_occupancy'] + VARS_NUM + VARS_CAT].dropna(
+    subset=['log_precio'] + VARS_CAT
+).copy()
 
-# Log precio (target para XGBoost)
-df['log_precio'] = np.log(df[TARGET_PRICE])
+# Imputar reviews con 0 para hosts nuevos (en predicción)
+for col in VARS_NUM:
+    if col in df_common.columns:
+        df_common[col] = pd.to_numeric(df_common[col], errors='coerce').fillna(0)
 
-# Alta ocupación (target binario para LogReg)
-mediana_ocup = df[TARGET_OCUP].median()
-df['alta_ocupacion'] = (df[TARGET_OCUP] > mediana_ocup).astype(int)
-print(f"Mediana ocupación: {mediana_ocup:.0f} noches/año")
-print(f"Alta ocupación (1): {df['alta_ocupacion'].sum()} | Baja (0): {(df['alta_ocupacion']==0).sum()}")
+print(f"Tras dropna: {df_common.shape[0]:,} filas")
 
-# ── Encoder para variables categóricas ───────────────────────────────────────
-enc = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
-df[VARS_CAT] = enc.fit_transform(df[VARS_CAT])
+# Consolidar categorías raras MIN_FREQ=50 (igual que notebook)
+for c in VARS_CAT:
+    df_common[c] = df_common[c].astype(str)
+    vc   = df_common[c].value_counts()
+    rare = vc[vc < 50].index
+    df_common.loc[df_common[c].isin(rare), c] = 'Otro'
+    print(f"  {c}: {df_common[c].nunique()} categorías")
 
-X = df[VARS_NUM + VARS_CAT].astype(float)
+# Guardar categorías antes del get_dummies (para predicción después)
+cat_categories = {c: sorted(df_common[c].unique().tolist()) for c in VARS_CAT}
 
-# ── MODELO 1: XGBoost Precio ─────────────────────────────────────────────────
-print("\n--- Entrenando XGBoost (precio)...")
-y_price = df['log_precio']
-X_tr, X_te, y_tr, y_te = train_test_split(X, y_price, test_size=0.2, random_state=42)
+# get_dummies igual que notebook
+df_d = pd.get_dummies(df_common, columns=VARS_CAT, drop_first=True, dtype=float)
+cat_cols = [c for c in df_d.columns if c.startswith('barrio_') or c.startswith('room_type_')]
+FEATURES = VARS_NUM + cat_cols
+print(f"Total features: {len(FEATURES)}")
 
+X     = df_d[FEATURES].copy()
+y_log = df_d['log_precio'].copy()
+
+# ── 4. Split 60/20/20 (igual que notebook Cell 12) ───────────────────────────
+idx_train, idx_temp = train_test_split(X.index, test_size=0.4, random_state=RANDOM_STATE)
+idx_valid, idx_test = train_test_split(idx_temp, test_size=0.5, random_state=RANDOM_STATE)
+
+X_train = X.loc[idx_train]; X_valid = X.loc[idx_valid]; X_test = X.loc[idx_test]
+y_train = y_log.loc[idx_train]; y_valid = y_log.loc[idx_valid]; y_test = y_log.loc[idx_test]
+print(f"\nTrain: {len(X_train):,} | Valid: {len(X_valid):,} | Test: {len(X_test):,}")
+
+# ── 5. XGBoost precio (hiperparámetros exactos notebook Cell 12) ──────────────
+print("\n--- Entrenando XGBoost precio (puede tardar 5-10 min)...")
 model_price = xgb.XGBRegressor(
-    n_estimators=400,
-    learning_rate=0.05,
-    max_depth=6,
+    n_estimators=8000,
+    learning_rate=0.03,
+    max_depth=8,
     subsample=0.8,
     colsample_bytree=0.8,
-    random_state=42,
+    min_child_weight=1,
+    reg_lambda=1,
+    objective='reg:squarederror',
+    random_state=RANDOM_STATE,
+    n_jobs=-1,
+    early_stopping_rounds=150,
     verbosity=0,
 )
-model_price.fit(X_tr, y_tr)
-r2 = r2_score(y_te, model_price.predict(X_te))
-print(f"R² precio (test): {r2:.3f}")
+model_price.fit(X_train, y_train, eval_set=[(X_valid, y_valid)], verbose=False)
 
-# ── MODELO 2: LogReg Alta Ocupación ──────────────────────────────────────────
-print("\n--- Entrenando LogisticRegression (ocupación)...")
-y_ocup = df['alta_ocupacion']
-X_tr2, X_te2, y_tr2, y_te2 = train_test_split(X, y_ocup, test_size=0.2, random_state=42)
+pred_test = model_price.predict(X_test)
+r2_price  = r2_score(y_test, pred_test)
+mae       = mean_absolute_error(y_test, pred_test)
+print(f"✅ R² precio (test) : {r2_price:.4f}  ← objetivo ~0.82")
+print(f"   Error típico     : ~{(np.exp(mae)-1)*100:.1f}%")
+print(f"   Best iteration   : {model_price.best_iteration}")
 
-scaler = StandardScaler()
-X_tr2_sc = scaler.fit_transform(X_tr2)
-X_te2_sc  = scaler.transform(X_te2)
+# ── 6. LogReg ocupación (Modelo 3 del notebook) ───────────────────────────────
+print("\n--- Entrenando LogisticRegression ocupación (Modelo 3)...")
+df_ocup      = df_d[df_d['estimated_occupancy'] > 0].copy()
+mediana_ocup = df_ocup['estimated_occupancy'].median()
+df_ocup['alta_ocupacion'] = (df_ocup['estimated_occupancy'] > mediana_ocup).astype(int)
+print(f"   Mediana ocupación : {mediana_ocup:.0f} noches/año")
+print(f"   Alta (1): {df_ocup['alta_ocupacion'].sum():,} | Baja (0): {(df_ocup['alta_ocupacion']==0).sum():,}")
 
-model_ocup = LogisticRegression(max_iter=1000, random_state=42)
-model_ocup.fit(X_tr2_sc, y_tr2)
-auc = roc_auc_score(y_te2, model_ocup.predict_proba(X_te2_sc)[:,1])
-print(f"AUC ocupación (test): {auc:.3f}")
+X_oc = df_ocup[FEATURES].copy()
+y_oc = df_ocup['alta_ocupacion']
+X_tr_o, X_te_o, y_tr_o, y_te_o = train_test_split(
+    X_oc, y_oc, test_size=0.2, random_state=RANDOM_STATE)
 
-# ── Guardar modelos ───────────────────────────────────────────────────────────
+scaler     = StandardScaler()
+X_tr_sc    = scaler.fit_transform(X_tr_o)
+X_te_sc    = scaler.transform(X_te_o)
+model_ocup = LogisticRegression(max_iter=1000, random_state=RANDOM_STATE)
+model_ocup.fit(X_tr_sc, y_tr_o)
+
+auc = roc_auc_score(y_te_o, model_ocup.predict_proba(X_te_sc)[:,1])
+print(f"✅ AUC ocupación (test) : {auc:.4f}  ← objetivo ~0.75")
+
+# ── 7. Guardar artefactos ─────────────────────────────────────────────────────
 artifacts = {
     'model_price':    model_price,
     'model_ocup':     model_ocup,
-    'encoder':        enc,
     'scaler':         scaler,
+    'features':       FEATURES,
     'vars_num':       VARS_NUM,
     'vars_cat':       VARS_CAT,
+    'cat_cols':       cat_cols,       # columnas dummy generadas
+    'cat_categories': cat_categories, # valores únicos por categoría
     'mediana_ocup':   mediana_ocup,
-    'cat_categories': {
-        'barrio':    enc.categories_[0].tolist(),
-        'room_type': enc.categories_[1].tolist(),
-    }
+    'r2_price':       r2_price,
+    'auc_ocup':       auc,
 }
 
 out_path = os.path.join(BASE_DIR, 'artifacts.pkl')
 with open(out_path, 'wb') as f:
     pickle.dump(artifacts, f)
 
-print(f"\n✅ Modelos guardados en: {out_path}")
-print("Ya puedes ejecutar: streamlit run app.py")
+print(f"\n{'='*50}")
+print(f"✅ Guardado en: {out_path}")
+print(f"   R² precio         : {r2_price:.4f}")
+print(f"   AUC ocupación     : {auc:.4f}")
+print("="*50)
+print("\nYa puedes ejecutar:  streamlit run app.py")
